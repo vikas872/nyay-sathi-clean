@@ -1,75 +1,107 @@
 # =============================================================================
-# Files to EXCLUDE from Docker build
+# Docker Build Exclusions - Nyay Sathi
+# =============================================================================
+# Optimized for smallest possible build context
+# Only backend/ and data/processed/ are needed for production
 # =============================================================================
 
-# Git
+# -----------------------------------------------------------------------------
+# Version Control
+# -----------------------------------------------------------------------------
 .git/
 .gitignore
 .gitattributes
 
-# Environment files (secrets - never include)
+# -----------------------------------------------------------------------------
+# Environment & Secrets (NEVER include in image)
+# -----------------------------------------------------------------------------
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
-# Python cache
+# -----------------------------------------------------------------------------
+# Python Artifacts
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# Virtual environments
+# -----------------------------------------------------------------------------
+# Virtual Environments (rebuilt in container)
+# -----------------------------------------------------------------------------
+.venv/
 venv/
 env/
-.venv/
-ENV/
+.conda/
 
-# IDE
+# -----------------------------------------------------------------------------
+# Package Manager Caches
+# -----------------------------------------------------------------------------
+.uv/
+uv.lock
+.pip/
+pip-cache/
+
+# -----------------------------------------------------------------------------
+# IDE & Editor
+# -----------------------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# =============================================================================
-# Data - ONLY exclude raw data, keep processed for runtime
-# =============================================================================
+# -----------------------------------------------------------------------------
+# OS Files
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Raw data (not needed for runtime)
-data/raw/
+# -----------------------------------------------------------------------------
+# Development & Testing
+# -----------------------------------------------------------------------------
+tests/
+test_*.py
+*_test.py
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Keep these (they ARE needed):
-# data/processed/faiss.index
-# data/processed/faiss_meta.pkl
-
-# =============================================================================
-# Development files (not needed in production)
-# =============================================================================
-
-# Scripts (data pipeline - only for development)
-scripts/
-
-# Documentation
+# -----------------------------------------------------------------------------
+# Documentation (not needed at runtime)
+# -----------------------------------------------------------------------------
 docs/
 *.md
 !README.md
+LICENSE
 
-# Test files
-test_*.py
-*_test.py
-tests/
-pytest.ini
-.pytest_cache/
+# -----------------------------------------------------------------------------
+# Project-specific Exclusions
+# -----------------------------------------------------------------------------
+
+# CLI (separate deployment, not needed in API container)
+cli/
+
+# Data pipeline scripts (dev only)
+scripts/
+
+# Raw data (FAISS index is built from this, but not needed at runtime)
+data/raw/
+
+# Only keep processed data
+# data/processed/faiss.index - INCLUDED
+# data/processed/faiss_meta.pkl - INCLUDED
+data/processed/sections_chunks.json
 
 # Logs
 *.log
 logs/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Build artifacts
-dist/
-build/
-*.egg-info/

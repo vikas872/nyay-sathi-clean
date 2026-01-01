@@ -35,14 +35,20 @@ GROQ_API_KEY: Final[str] = os.getenv("GROQ_API_KEY", "")
 # =============================================================================
 
 EMBEDDING_MODEL: Final[str] = "sentence-transformers/all-MiniLM-L6-v2"
-GROQ_MODEL: Final[str] = "llama-3.1-8b-instant"
+
+# Groq models ranked by capability:
+# - llama-3.3-70b-versatile: 128K context, best reasoning (recommended)
+# - llama-3.1-70b-versatile: 128K context, great reasoning
+# - llama-3.1-8b-instant: 8K context, fast but limited (previous default)
+GROQ_MODEL: Final[str] = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # =============================================================================
 # RAG SETTINGS
 # =============================================================================
 
 TOP_K: Final[int] = 5
-CONFIDENCE_THRESHOLD: Final[float] = 0.50
+# Higher threshold = more confident/relevant results only
+CONFIDENCE_THRESHOLD: Final[float] = 0.60
 
 # =============================================================================
 # SERVER SETTINGS
@@ -79,4 +85,31 @@ API_SECRET_KEYS: Final[list[str]] = [k.strip() for k in _keys_str.split(",") if 
 
 # Rate limit (requests per minute per IP)
 RATE_LIMIT_PER_MINUTE: Final[int] = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+# =============================================================================
+# WEB SEARCH FALLBACK
+# =============================================================================
+
+WEB_SEARCH_ENABLED: Final[bool] = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
+WEB_SEARCH_TIMEOUT: Final[float] = float(os.getenv("WEB_SEARCH_TIMEOUT", "10.0"))
+WEB_SEARCH_MAX_RESULTS: Final[int] = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
+
+# =============================================================================
+# GPU / DEVICE CONFIGURATION
+# =============================================================================
+
+# Auto-detect GPU availability
+def _detect_device() -> str:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"  # Apple Silicon
+    except ImportError:
+        pass
+    return "cpu"
+
+DEVICE: Final[str] = os.getenv("DEVICE", _detect_device())
+
 

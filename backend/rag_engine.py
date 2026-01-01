@@ -1,19 +1,25 @@
 """
-RAG Engine for Nyay Sathi.
+RAG Engine for Nyay Sathi v2.0.
 
-Handles FAISS-based retrieval and LLM-powered explanations
-for legal questions.
+Handles FAISS-based retrieval, LLM-powered explanations,
+and web search fallback for legal questions.
+
+Features:
+- GPU acceleration when available
+- Parallel embedding generation
+- Hybrid search (local + web fallback)
+- Confidence-based routing
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
-# Force CPU mode for Railway/free-tier compatibility
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["TORCH_DEVICE"] = "cpu"
+# Force environment before torch import
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import faiss
@@ -28,18 +34,21 @@ from config import (
     GROQ_API_KEY,
     TOP_K,
     CONFIDENCE_THRESHOLD,
+    DEVICE,
+    WEB_SEARCH_ENABLED,
 )
 from logger import rag_logger as logger
 
 
 # =============================================================================
-# GLOBAL STATE (Lazy Loading)
+# GLOBAL STATE (Lazy Loading for Memory Efficiency)
 # =============================================================================
 
 _index: Optional[faiss.Index] = None
 _metadata: Optional[list[dict]] = None
 _embedder: Any = None
 _client: Optional[Groq] = None
+_executor: Optional[ThreadPoolExecutor] = None
 
 
 # =============================================================================
@@ -50,7 +59,7 @@ def initialize_rag() -> int:
     """
     Initialize the RAG system.
 
-    Loads FAISS index and metadata. Embedding model is loaded lazily.
+    Loads FAISS index and metadata. Embedding model is loaded lazily on first query.
 
     Returns:
         Number of vectors in the index.
@@ -58,9 +67,9 @@ def initialize_rag() -> int:
     Raises:
         FileNotFoundError: If required files are missing.
     """
-    global _index, _metadata, _client
+    global _index, _metadata, _client, _executor
 
-    logger.info("Initializing RAG system...")
+    logger.info(f"Initializing RAG system (device: {DEVICE})...")
     logger.debug(f"FAISS path: {FAISS_INDEX_PATH}")
 
     if not FAISS_INDEX_PATH.exists():
@@ -85,6 +94,17 @@ def initialize_rag() -> int:
     else:
         logger.warning("GROQ_API_KEY not set - LLM explanations disabled")
 
+    # Initialize thread pool for parallel operations
+    _executor = ThreadPoolExecutor(max_workers=4)
+    logger.debug("Thread pool initialized")
+
+    return _index.ntotal
+
+
+def get_vectors_count() -> int:
+    """Return the number of vectors in the index."""
+    if _index is None:
+        return 0
     return _index.ntotal
 
 
@@ -92,16 +112,17 @@ def _get_embedder():
     """
     Lazy-load the embedding model.
 
-    This prevents OOM on free-tier hosting during startup.
+    Uses the configured device (GPU if available).
     """
     global _embedder
-    
+
     if _embedder is None:
-        logger.info("Loading embedding model (first query)...")
+        logger.info(f"Loading embedding model on {DEVICE}...")
         from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
-        logger.info("Embedding model loaded")
-    
+
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
+        logger.info(f"Embedding model loaded on {DEVICE}")
+
     return _embedder
 
 
@@ -109,12 +130,13 @@ def _get_embedder():
 # RETRIEVAL
 # =============================================================================
 
-def retrieve_sections(query: str) -> list[dict]:
+def retrieve_sections(query: str, top_k: int = TOP_K) -> list[dict]:
     """
     Retrieve relevant legal sections for a query.
 
     Args:
         query: The user's question.
+        top_k: Number of results to retrieve.
 
     Returns:
         List of matching sections with scores.
@@ -133,7 +155,7 @@ def retrieve_sections(query: str) -> list[dict]:
     ).astype("float32")
 
     # Search
-    scores, indices = _index.search(query_vec, TOP_K)
+    scores, indices = _index.search(query_vec, top_k)
 
     results = []
     for score, idx in zip(scores[0], indices[0]):
@@ -143,8 +165,51 @@ def retrieve_sections(query: str) -> list[dict]:
         record["score"] = float(score)
         results.append(record)
 
-    logger.debug(f"Retrieved {len(results)} sections for query")
+    logger.debug(f"Retrieved {len(results)} sections (top score: {results[0]['score']:.3f})" if results else "No results")
     return results
+
+
+# Alias for agent.py
+retrieve = retrieve_sections
+
+
+async def retrieve_with_web_fallback(
+    query: str,
+    top_k: int = TOP_K,
+) -> tuple[list[dict], list[Any], str]:
+    """
+    Retrieve sections with optional web search fallback.
+
+    If local RAG results have low confidence, also searches trusted web sources.
+
+    Args:
+        query: The user's question.
+        top_k: Number of local results to retrieve.
+
+    Returns:
+        Tuple of (local_results, web_results, source_mode).
+    """
+    # Get local results first
+    local_results = retrieve_sections(query, top_k)
+
+    # Determine if we need web fallback
+    top_score = local_results[0]["score"] if local_results else 0.0
+    needs_web_fallback = top_score < CONFIDENCE_THRESHOLD and WEB_SEARCH_ENABLED
+
+    web_results = []
+    source_mode = "local"
+
+    if needs_web_fallback:
+        logger.info("Low confidence - triggering web search fallback")
+        try:
+            from web_search import search_trusted_sources
+            web_results = await search_trusted_sources(query)
+            if web_results:
+                source_mode = "hybrid"
+        except Exception as e:
+            logger.error(f"Web search fallback failed: {e}")
+
+    return local_results, web_results, source_mode
 
 
 # =============================================================================
@@ -152,33 +217,48 @@ def retrieve_sections(query: str) -> list[dict]:
 # =============================================================================
 
 SYSTEM_PROMPT_GROUNDED = """You are Nyay Sathi, a helpful Indian legal assistant.
-MODE: RAG-BACKED (HIGH CONFIDENCE).
 
-INSTRUCTIONS:
-1. Use ONLY the provided legal text.
-2. Mention Act Name and Section Number if present.
-3. Explain in simple, clear English.
-4. If text does not answer the question, say so clearly.
-5. Do NOT invent laws or punishments.
-6. Do NOT give legal advice.
+You have been given legal text from Indian laws. Use ONLY this information to answer.
 
-MANDATORY DISCLAIMER:
-End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
+RULES:
+1. Use numbered citations like [1], [2] when referencing sources.
+2. Mention the Act Name and Section when citing.
+3. Explain in simple English a layperson can understand.
+4. If the sources don't answer the question, say so.
+5. Do NOT invent information not in the sources.
+6. Keep your answer concise and focused.
+
+End with: "Disclaimer: For educational purposes only, not legal advice."
+"""
+
+SYSTEM_PROMPT_HYBRID = """You are Nyay Sathi, a helpful Indian legal assistant.
+
+You have legal text from a database AND verified web sources. Synthesize both.
+
+RULES:
+1. Use numbered citations like [1], [2] when referencing sources.
+2. Prioritize official legal text over web sources.
+3. Mention source names (Act, Section, or website).
+4. Explain in simple English.
+5. Keep your answer concise.
+
+End with: "Disclaimer: For educational purposes only, not legal advice."
 """
 
 SYSTEM_PROMPT_FALLBACK = """You are Nyay Sathi, a helpful Indian legal assistant.
-MODE: GENERAL FALLBACK.
 
-INSTRUCTIONS:
-1. No specific legal section matched the query.
+No specific legal section matched this query. Be honest about limitations.
+
+RULES:
+1. Acknowledge you don't have specific legal text for this.
 2. Do NOT cite specific Acts or Sections.
-3. Give only high-level educational explanation.
-4. Suggest the user rephrase their question.
-5. Do NOT give legal advice.
+3. Give only general educational information.
+4. Suggest rephrasing the question.
+5. Keep it brief.
 
-MANDATORY DISCLAIMER:
-End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
+End with: "Disclaimer: For educational purposes only, not legal advice."
 """
+
 
 
 # =============================================================================
@@ -187,43 +267,70 @@ End with: "Disclaimer: This information is for educational purposes only and doe
 
 def explain_with_llm(
     query: str,
-    retrieved: list[dict],
+    local_results: list[dict],
+    web_results: Optional[list] = None,
+    source_mode: str = "local",
 ) -> tuple[str, str, float]:
     """
     Generate an LLM explanation for retrieved sections.
 
     Args:
         query: The user's question.
-        retrieved: List of retrieved sections.
+        local_results: List of locally retrieved sections.
+        web_results: Optional list of web search results.
+        source_mode: One of "local", "hybrid", "fallback".
 
     Returns:
-        Tuple of (mode, explanation, top_score).
+        Tuple of (mode, explanation, confidence_score).
     """
-    # Determine mode based on confidence
-    if not retrieved:
+    # Determine confidence and mode
+    if not local_results and not web_results:
         mode = "fallback"
         top_score = 0.0
     else:
-        top_score = retrieved[0]["score"]
-        mode = "grounded" if top_score >= CONFIDENCE_THRESHOLD else "fallback"
+        top_score = local_results[0]["score"] if local_results else 0.0
+        if source_mode == "hybrid":
+            mode = "hybrid"
+        elif top_score >= CONFIDENCE_THRESHOLD:
+            mode = "grounded"
+        else:
+            mode = "fallback"
 
     logger.debug(f"LLM mode: {mode}, top_score: {top_score:.3f}")
 
-    # Build prompt
-    if mode == "grounded":
-        context = ""
-        for r in retrieved:
-            context += (
-                f"---\n"
-                f"Act: {r.get('act_name', 'Unknown')}\n"
-                f"Section: {r.get('section_number', 'Unknown')}\n"
-                f"Text: {r.get('text', '')}\n"
+    # Build context with numbered citations
+    context_parts = []
+
+    # Only use top 3 sources with decent scores
+    relevant_local = [r for r in local_results if r.get("score", 0) >= 0.5][:3]
+
+    if relevant_local and mode in ("grounded", "hybrid"):
+        context_parts.append("SOURCES:")
+        for i, r in enumerate(relevant_local, 1):
+            context_parts.append(
+                f"[{i}] {r.get('act_name', 'Unknown')} - Section {r.get('section_number', 'Unknown')}\n"
+                f"    {r.get('text', '')[:800]}\n"
             )
-        user_content = f"USER QUESTION:\n{query}\n\nLEGAL TEXT:\n{context}"
+
+    if web_results and mode == "hybrid":
+        start_idx = len(relevant_local) + 1
+        for i, wr in enumerate(web_results[:2], start_idx):
+            context_parts.append(
+                f"[{i}] {wr.title} ({wr.source_domain})\n"
+                f"    {wr.snippet[:400]}\n"
+            )
+
+    context = "\n".join(context_parts) if context_parts else "(No relevant sources found)"
+
+    # Select prompt
+    if mode == "grounded":
         system_prompt = SYSTEM_PROMPT_GROUNDED
+    elif mode == "hybrid":
+        system_prompt = SYSTEM_PROMPT_HYBRID
     else:
-        user_content = f"USER QUESTION:\n{query}\n\n(No relevant legal text found)"
         system_prompt = SYSTEM_PROMPT_FALLBACK
+
+    user_content = f"USER QUESTION:\n{query}\n\nAVAILABLE INFORMATION:\n{context}"
 
     # Call LLM
     if _client is None:
@@ -243,11 +350,17 @@ def explain_with_llm(
                 {"role": "user", "content": user_content},
             ],
             temperature=0.1,
-            max_tokens=500,
+            max_tokens=800,
         )
         explanation = response.choices[0].message.content.strip()
-        logger.debug("LLM response generated successfully")
-        return mode, explanation, top_score
+        
+        # Extract token usage
+        usage = response.usage
+        tokens_in = usage.prompt_tokens if usage else 0
+        tokens_out = usage.completion_tokens if usage else 0
+        
+        logger.debug(f"LLM response: {tokens_in}→{tokens_out} tokens")
+        return mode, explanation, top_score, tokens_in, tokens_out
 
     except Exception as e:
         logger.error(f"LLM error: {e}")
@@ -257,4 +370,45 @@ def explain_with_llm(
             "Please try again later.\n\n"
             "Disclaimer: This information is for educational purposes only.",
             0.0,
+            0,
+            0,
         )
+
+
+async def process_query(query: str) -> dict:
+    """
+    Process a user query end-to-end.
+
+    This is the main entry point for the RAG pipeline.
+
+    Args:
+        query: The user's legal question.
+
+    Returns:
+        Dictionary with answer, sources, confidence, and mode.
+    """
+    # Retrieve with optional web fallback
+    local_results, web_results, source_mode = await retrieve_with_web_fallback(query)
+
+    # Generate explanation
+    mode, explanation, score, tokens_in, tokens_out = explain_with_llm(
+        query, local_results, web_results, source_mode
+    )
+
+    # Format response
+    return {
+        "mode": mode,
+        "answer": explanation,
+        "confidence": score,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "local_sources": local_results,
+        "web_sources": [
+            {
+                "url": wr.url,
+                "title": wr.title,
+                "domain": wr.source_domain,
+            }
+            for wr in (web_results or [])
+        ],
+    }
