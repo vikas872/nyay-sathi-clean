@@ -1,0 +1,10 @@
+data/
+*.pkl
+*.faiss
+*.index
+__pycache__/
+.git/
+.gitignore
+scripts/
+venv/
+.env
