@@ -14,9 +14,9 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Large ML artifacts (optional – keep local)
-*.index
-*.pkl
+# # Large ML artifacts (optional – keep local)
+# *.index
+# *.pkl
 
 # VS Code
 .vscode/
