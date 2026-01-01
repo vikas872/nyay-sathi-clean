@@ -1,60 +1,72 @@
+"""
+Clean and deduplicate section data.
+
+This script deduplicates sections, removes invalid/short entries,
+and ensures consistent data quality.
+"""
+
 import json
 from pathlib import Path
 
-INPUT_FILE = Path("data/processed/normalized_sections.json")
-OUTPUT_FILE = Path("data/processed/sections_clean.json")
+from config import NORMALIZED_FILE, CLEAN_FILE, MIN_TEXT_LENGTH, ensure_directories
+from utils import setup_logger, is_valid_section_text
 
-def is_valid_text(text):
-    if not text:
-        return False
-    if len(text) < 40:
-        return False
-    
-    # Check for truncated endings
-    invalid_endings = ("by", "of", "and", ":", "the", "or", "for")
-    stripped_text = text.strip()
-    if stripped_text.lower().endswith(invalid_endings):
-        return False
-        
-    return True
+logger = setup_logger(__name__)
 
-def clean_data():
-    if not INPUT_FILE.exists():
-        print(f"Error: {INPUT_FILE} not found.")
-        return
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def deduplicate_sections(data: list[dict]) -> tuple[dict, int]:
+    """
+    Deduplicate sections, keeping the longest text for each key.
 
-    total_records = len(data)
+    Args:
+        data: List of section records.
+
+    Returns:
+        Tuple of (unique sections dict, duplicates count).
+    """
     unique_sections = {}
     duplicates_removed = 0
     
-    # Deduplication and Grouping
     for record in data:
         key = (record["act_name"], str(record["section_number"]))
         
         if key in unique_sections:
             duplicates_removed += 1
-            existing_record = unique_sections[key]
+            existing = unique_sections[key]
             # Keep the one with longer text
-            if len(record.get("text", "")) > len(existing_record.get("text", "")):
+            if len(record.get("text", "")) > len(existing.get("text", "")):
                 unique_sections[key] = record
         else:
             unique_sections[key] = record
+    
+    return unique_sections, duplicates_removed
 
-    # Quality Filtering and Schema Enforcement
+
+def filter_and_clean(
+    unique_sections: dict,
+    min_length: int = MIN_TEXT_LENGTH,
+) -> tuple[list[dict], int]:
+    """
+    Filter invalid sections and enforce schema.
+
+    Args:
+        unique_sections: Dictionary of unique sections.
+        min_length: Minimum text length for valid section.
+
+    Returns:
+        Tuple of (clean records list, dropped count).
+    """
     clean_records = []
     invalid_dropped = 0
     
     for record in unique_sections.values():
         text = record.get("text", "").strip()
         
-        if not is_valid_text(text):
+        if not is_valid_section_text(text, min_length):
             invalid_dropped += 1
             continue
-            
-        # Enforce Schema
+        
+        # Enforce consistent schema
         clean_record = {
             "id": record["id"],
             "act_name": record["act_name"],
@@ -62,31 +74,49 @@ def clean_data():
             "category": record["category"],
             "section_number": record["section_number"],
             "text": text,
-            "source": record.get("source", "India Code")
+            "source": record.get("source", "India Code"),
         }
         clean_records.append(clean_record)
-
+    
     # Sort for deterministic output
     clean_records.sort(key=lambda x: (x["act_name"], x["id"]))
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(clean_records, f, indent=2, ensure_ascii=False)
-
-    print("-" * 30)
-    print("DATA CLEANING SUMMARY")
-    print("-" * 30)
-    print(f"Total input records: {total_records}")
-    print(f"After deduplication: {len(unique_sections)}")
-    print(f"Duplicates found:    {duplicates_removed}")
-    print(f"Invalid dropped:     {invalid_dropped}")
-    print(f"FINAL CLEAN COUNT:   {len(clean_records)}")
-    print("-" * 30)
     
-    # Final Validation
-    if len(clean_records) == 0:
-        print("CRITICAL WARNING: Output file is empty!")
-    else:
-        print(f"✅ Success! Clean data written to: {OUTPUT_FILE}")
+    return clean_records, invalid_dropped
+
+
+def main() -> None:
+    """Main entry point for data cleaning."""
+    logger.info("Starting data cleaning...")
+    ensure_directories()
+    
+    if not NORMALIZED_FILE.exists():
+        logger.error(f"Input file not found: {NORMALIZED_FILE}")
+        return
+    
+    with open(NORMALIZED_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    total_input = len(data)
+    logger.info(f"Loaded {total_input} records")
+    
+    # Deduplicate
+    unique_sections, duplicates = deduplicate_sections(data)
+    logger.info(f"Removed {duplicates} duplicates")
+    
+    # Filter and clean
+    clean_records, invalid_count = filter_and_clean(unique_sections)
+    logger.info(f"Dropped {invalid_count} invalid records")
+    
+    # Write output
+    CLEAN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLEAN_FILE.write_text(
+        json.dumps(clean_records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    
+    logger.info(f"Final clean count: {len(clean_records)}")
+    logger.info(f"Output: {CLEAN_FILE}")
+
 
 if __name__ == "__main__":
-    clean_data()
+    main()

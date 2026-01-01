@@ -1,25 +1,48 @@
+# =============================================================================
+# Git Ignore for Nyay Sathi
+# =============================================================================
+
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
 
-# Virtual environment
+# Virtual environments
 venv/
-.env/
+env/
+.venv/
 .conda/
+ENV/
+
+# Environment files (secrets)
+.env
 .env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# # Large ML artifacts (optional – keep local)
-# *.index
-# *.pkl
-
-# VS Code
-.vscode/
-
 # Logs
 *.log
+logs/
+
+# =============================================================================
+# Project-specific excludes
+# =============================================================================
+
+# Keep .env.example (template for others)
+!.env.example
+
+# Large data files (optional - uncomment to exclude from git)
+# data/raw/
+# data/processed/*.index
+# data/processed/*.pkl

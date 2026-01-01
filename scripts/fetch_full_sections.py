@@ -1,163 +1,217 @@
-import os
-import time
-import requests
+"""
+Fetch full section content from India Code API.
+
+This script iterates through act HTML files and fetches the complete
+text content for each section using India Code's internal API.
+"""
+
 import json
 import re
+import time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-ACTS_HTML_DIR = Path("data/raw/acts_html")
-SECTIONS_DIR = Path("data/raw/sections_html")
-BASE_URL = "https://www.indiacode.nic.in"
-SHOW_DATA_URL = "https://www.indiacode.nic.in/show-data"
-API_ENDPOINT = "https://www.indiacode.nic.in/SectionPageContent"
+import requests
+from bs4 import BeautifulSoup
 
-def fetch_sections():
-    if not ACTS_HTML_DIR.exists():
-        print(f"Error: {ACTS_HTML_DIR} does not exist.")
-        return
+from config import (
+    ACTS_HTML_DIR,
+    SECTIONS_HTML_DIR,
+    INDIACODE_SHOW_DATA_URL,
+    INDIACODE_API_ENDPOINT,
+    REQUEST_HEADERS,
+    REQUEST_TIMEOUT,
+    REQUEST_DELAY,
+    ensure_directories,
+)
+from utils import setup_logger
 
-    SECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+logger = setup_logger(__name__)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    })
+MAX_CONSECUTIVE_ERRORS: int = 20
+MAX_ORDERNO: int = 2000
 
-    from bs4 import BeautifulSoup
 
-    for act_file in ACTS_HTML_DIR.glob("*.html"):
-        print(f"Processing Act: {act_file.name}")
-        act_slug = act_file.stem
+def extract_act_id(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Extract the act ID from HTML meta tags or links.
+
+    Args:
+        soup: Parsed BeautifulSoup object.
+
+    Returns:
+        Act ID string or None if not found.
+    """
+    # Try meta tag first
+    for meta in soup.find_all("meta", attrs={"name": "DC.identifier"}):
+        content = meta.get("content", "")
+        if content.startswith("AC_") or content.startswith("act"):
+            return content
+    
+    # Fallback to link search
+    for link in soup.find_all("a", href=True):
+        if "show-data" in link["href"]:
+            qs = parse_qs(urlparse(link["href"]).query)
+            for key, value in qs.items():
+                if key.lower() == "actid":
+                    return value[0]
+    
+    return None
+
+
+def fetch_section_content(
+    session: requests.Session,
+    act_id: str,
+    section_id: str,
+) -> Optional[dict]:
+    """
+    Fetch section content from India Code API.
+
+    Args:
+        session: Requests session.
+        act_id: Act identifier.
+        section_id: Section identifier.
+
+    Returns:
+        JSON response or None if failed.
+    """
+    headers = session.headers.copy()
+    headers["X-Requested-With"] = "XMLHttpRequest"
+    
+    params = {"actid": act_id, "sectionID": section_id}
+    
+    try:
+        response = session.get(
+            INDIACODE_API_ENDPOINT,
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code == 200:
+            return response.json()
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        logger.debug(f"API request failed: {e}")
+    
+    return None
+
+
+def process_act(
+    act_file: Path,
+    session: requests.Session,
+    output_dir: Path,
+) -> int:
+    """
+    Process a single act file and fetch all sections.
+
+    Args:
+        act_file: Path to act HTML file.
+        session: Requests session.
+        output_dir: Directory to save section JSON files.
+
+    Returns:
+        Number of sections successfully fetched.
+    """
+    logger.info(f"Processing: {act_file.name}")
+    act_slug = act_file.stem
+    
+    with open(act_file, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f, "html.parser")
+    
+    act_id = extract_act_id(soup)
+    if not act_id:
+        logger.warning(f"Could not find act ID for {act_file.name}")
+        return 0
+    
+    logger.debug(f"Act ID: {act_id}")
+    
+    sections_fetched = 0
+    orderno = 1
+    error_count = 0
+    
+    while orderno <= MAX_ORDERNO:
+        page_url = f"{INDIACODE_SHOW_DATA_URL}?actid={act_id}&orderno={orderno}"
         
-        # 1. Get Act ID from the file (meta tag)
-        actid = None
-        with open(act_file, "r", encoding="utf-8") as f:
-            soup = BeautifulSoup(f, "html.parser")
-            # Look for <meta name="DC.identifier" content="AC_...">
-            metas = soup.find_all("meta", attrs={"name": "DC.identifier"})
-            for m in metas:
-                c = m.get("content", "")
-                if c.startswith("AC_") or c.startswith("act"):
-                    actid = c
-                    break
-        
-        # Fallback to link search if meta fails (rare)
-        if not actid:
-            for link in soup.find_all("a", href=True):
-                if "show-data" in link["href"]:
-                    qs = parse_qs(urlparse(link["href"]).query)
-                    for k, v in qs.items():
-                         if k.lower() == "actid":
-                             actid = v[0]
-                             break
-                    if actid: break
-        
-        if not actid:
-            print(f"  Could not find actid for {act_file.name}. Skipping.")
-            continue
+        try:
+            response = session.get(page_url, timeout=REQUEST_TIMEOUT)
             
-        print(f"  Act ID: {actid}")
-        
-        # 2. Iterate OrderNo
-        orderno = 1
-        max_errors = 20 # Tolerant range
-        error_count = 0
-        
-        while True:
-            # Check if file already exists (optimization)
-            # Since we construct filename with secId, we don't know it yet.
-            # But we can check if we have a file with this orderno?
-            # Creating a map of existing files might be expensive every loop.
-            # Let's just fetch. Be polite.
-            
-            # Fetch Page
-            page_url = f"{SHOW_DATA_URL}?actid={actid}&orderno={orderno}"
-            try:
-                # print(f"    Fetching OrderNo {orderno}...")
-                resp = session.get(page_url, timeout=10)
-                
-                if "Invalid URL" in resp.text:
-                    print(f"    OrderNo {orderno}: Invalid URL.")
-                    # Don't stop immediately. Tolerating consecutive errors.
-                    error_count += 1
-                    if error_count > max_errors: # e.g. 5 consecutive
-                         print("    Too many errors. Stopping Act.")
-                         break
-                    orderno += 1
-                    continue
-                
-                # Check for other errors
-                if resp.status_code != 200:
-                    print(f"    OrderNo {orderno}: Status {resp.status_code}.")
-                    error_count += 1
-                    if error_count > max_errors: break
-                    orderno += 1
-                    continue
-                
-                # Use greedy regex for secId
-                match = re.search(r"secId\s*=\s*'(\d+)';", resp.text)
-                if not match:
-                     match = re.search(r"sectionId\s*=\s*'(\d+)';", resp.text)
-                
-                if not match:
-                     # print(f"    OrderNo {orderno}: No secId found.")
-                     # Not every orderno is a section (e.g. could be chapter header page?)
-                     # But valid show-data pages usually have secId.
-                     error_count += 1 # Count as error-like?
-                     if error_count > max_errors: break
-                     orderno += 1
-                     continue
-                
-                secId = match.group(1)
-                
-                # Check if exists
-                safe_sec_num = str(orderno) # User wants valid section number, but orderno is proxy.
-                # Use secId in filename to be unique
-                filename = f"{act_slug}_ord_{orderno}_sec_{secId}.json"
-                filepath = SECTIONS_DIR / filename
-                
-                if filepath.exists():
-                     # print(f"    Skipping {filename} (exists)")
-                     orderno += 1
-                     continue
-                
-                # Fetch API Content
-                # Needs header X-Requested-With
-                headers_api = session.headers.copy()
-                headers_api["X-Requested-With"] = "XMLHttpRequest"
-                
-                api_params = {"actid": actid, "sectionID": secId}
-                api_resp = session.get(API_ENDPOINT, params=api_params, headers=headers_api, timeout=10)
-                
-                if api_resp.status_code == 200:
-                     data = api_resp.json()
-                     data["_meta"] = {
-                         "act_slug": act_slug,
-                         "act_id": actid,
-                         "section_id": secId,
-                         "orderno": orderno,
-                         "url": page_url
-                     }
-                     with open(filepath, "w", encoding="utf-8") as f_out:
-                         json.dump(data, f_out, indent=2)
-                     print(f"    Saved: {filename}")
-                     error_count = 0 # swift success
-                else:
-                     print(f"    API Failed {api_resp.status_code} for {secId}")
-                
-            except Exception as e:
-                print(f"    Error on OrderNo {orderno}: {e}")
+            if "Invalid URL" in response.text or response.status_code != 200:
                 error_count += 1
-                if error_count > max_errors: break
+                if error_count > MAX_CONSECUTIVE_ERRORS:
+                    logger.debug(f"Max errors reached at orderno {orderno}")
+                    break
+                orderno += 1
+                continue
             
-            orderno += 1
-            # Simple limiter
-            if orderno > 2000:
-                print("    Reached safety limit 2000. Stopping Act.")
-                break
+            # Extract section ID from page
+            match = re.search(r"secId\s*=\s*'(\d+)';", response.text)
+            if not match:
+                match = re.search(r"sectionId\s*=\s*'(\d+)';", response.text)
+            
+            if not match:
+                error_count += 1
+                if error_count > MAX_CONSECUTIVE_ERRORS:
+                    break
+                orderno += 1
+                continue
+            
+            section_id = match.group(1)
+            filename = f"{act_slug}_ord_{orderno}_sec_{section_id}.json"
+            filepath = output_dir / filename
+            
+            # Skip if already exists
+            if filepath.exists():
+                orderno += 1
+                continue
+            
+            # Fetch section content from API
+            content = fetch_section_content(session, act_id, section_id)
+            
+            if content:
+                content["_meta"] = {
+                    "act_slug": act_slug,
+                    "act_id": act_id,
+                    "section_id": section_id,
+                    "orderno": orderno,
+                    "url": page_url,
+                }
                 
-            time.sleep(0.05) # fast
+                filepath.write_text(
+                    json.dumps(content, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                logger.debug(f"Saved: {filename}")
+                sections_fetched += 1
+                error_count = 0
+            
+        except requests.RequestException as e:
+            logger.debug(f"Request error at orderno {orderno}: {e}")
+            error_count += 1
+            if error_count > MAX_CONSECUTIVE_ERRORS:
+                break
+        
+        orderno += 1
+        time.sleep(REQUEST_DELAY)
+    
+    logger.info(f"Fetched {sections_fetched} sections from {act_file.name}")
+    return sections_fetched
+
+
+def main() -> None:
+    """Main entry point for fetching sections."""
+    logger.info("Starting section fetch...")
+    ensure_directories()
+    
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    
+    total_sections = 0
+    
+    for act_file in sorted(ACTS_HTML_DIR.glob("*.html")):
+        total_sections += process_act(act_file, session, SECTIONS_HTML_DIR)
+    
+    logger.info(f"Complete. Total sections fetched: {total_sections}")
+
 
 if __name__ == "__main__":
-    fetch_sections()
+    main()

@@ -1,122 +1,157 @@
-# ================= RAILWAY / FREE-TIER SAFE RAG ENGINE =================
-import os
+"""
+RAG Engine for Nyay Sathi.
 
-# ---- HARD SAFETY FLAGS (must be first) ----
+Handles FAISS-based retrieval and LLM-powered explanations
+for legal questions.
+"""
+
+from __future__ import annotations
+
+import os
+import pickle
+from typing import Any, Optional
+
+# Force CPU mode for Railway/free-tier compatibility
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TORCH_DEVICE"] = "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import pickle
 import faiss
 import numpy as np
-from pathlib import Path
-from dotenv import load_dotenv
 from groq import Groq
 
-# ---------------- ENV ----------------
-load_dotenv()
+from config import (
+    FAISS_INDEX_PATH,
+    FAISS_META_PATH,
+    EMBEDDING_MODEL,
+    GROQ_MODEL,
+    GROQ_API_KEY,
+    TOP_K,
+    CONFIDENCE_THRESHOLD,
+)
+from logger import rag_logger as logger
 
-# ---------------- PATH RESOLUTION ----------------
-# File is: backend/rag_engine.py
-# Repo root is one level up from backend/
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data" / "processed"
 
-FAISS_INDEX_PATH = DATA_DIR / "faiss.index"
-FAISS_META_PATH = DATA_DIR / "faiss_meta.pkl"
+# =============================================================================
+# GLOBAL STATE (Lazy Loading)
+# =============================================================================
 
-# ---------------- CONFIG ----------------
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GROQ_MODEL = "llama-3.1-8b-instant"
-TOP_K = 5
-CONFIDENCE_THRESHOLD = 0.50
+_index: Optional[faiss.Index] = None
+_metadata: Optional[list[dict]] = None
+_embedder: Any = None
+_client: Optional[Groq] = None
 
-# ---------------- GLOBALS (LAZY) ----------------
-index = None
-metadata = None
-embedder = None
-client = None
 
-# ======================================================================
-# INITIALIZATION (LIGHTWEIGHT ONLY)
-# ======================================================================
+# =============================================================================
+# INITIALIZATION
+# =============================================================================
 
-def initialize_rag():
+def initialize_rag() -> int:
     """
-    Initialize ONLY what is required for startup.
-    DO NOT load embedding model here (memory heavy).
-    """
-    global index, metadata, client
+    Initialize the RAG system.
 
-    print("Starting Nyay Sathi Backend (Railway Safe Mode)")
-    print(f"FAISS path: {FAISS_INDEX_PATH}")
+    Loads FAISS index and metadata. Embedding model is loaded lazily.
+
+    Returns:
+        Number of vectors in the index.
+
+    Raises:
+        FileNotFoundError: If required files are missing.
+    """
+    global _index, _metadata, _client
+
+    logger.info("Initializing RAG system...")
+    logger.debug(f"FAISS path: {FAISS_INDEX_PATH}")
 
     if not FAISS_INDEX_PATH.exists():
-        raise FileNotFoundError(f"FAISS index not found at {FAISS_INDEX_PATH}")
+        raise FileNotFoundError(f"FAISS index not found: {FAISS_INDEX_PATH}")
 
     if not FAISS_META_PATH.exists():
-        raise FileNotFoundError(f"FAISS metadata not found at {FAISS_META_PATH}")
+        raise FileNotFoundError(f"FAISS metadata not found: {FAISS_META_PATH}")
 
-    # Load FAISS index (read-only, CPU)
-    index = faiss.read_index(str(FAISS_INDEX_PATH))
-    print(f"FAISS loaded with {index.ntotal} vectors")
+    # Load FAISS index
+    _index = faiss.read_index(str(FAISS_INDEX_PATH))
+    logger.info(f"Loaded FAISS index with {_index.ntotal} vectors")
 
     # Load metadata
     with open(FAISS_META_PATH, "rb") as f:
-        metadata = pickle.load(f)
+        _metadata = pickle.load(f)
+    logger.debug(f"Loaded {len(_metadata)} metadata records")
 
-    # Init Groq client
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    # Initialize Groq client
+    if GROQ_API_KEY:
+        _client = Groq(api_key=GROQ_API_KEY)
+        logger.info("Groq client initialized")
+    else:
+        logger.warning("GROQ_API_KEY not set - LLM explanations disabled")
 
-    print("RAG system initialized successfully (light mode)")
+    return _index.ntotal
 
-# ======================================================================
-# LAZY EMBEDDING MODEL LOADER
-# ======================================================================
 
-def get_embedder():
+def _get_embedder():
     """
-    Load SentenceTransformer ONLY when first query comes.
-    Prevents Railway free-tier OOM during startup.
+    Lazy-load the embedding model.
+
+    This prevents OOM on free-tier hosting during startup.
     """
-    global embedder
-    if embedder is None:
-        print("Loading embedding model lazily...")
+    global _embedder
+    
+    if _embedder is None:
+        logger.info("Loading embedding model (first query)...")
         from sentence_transformers import SentenceTransformer
-        embedder = SentenceTransformer(EMBED_MODEL, device="cpu")
-    return embedder
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+        logger.info("Embedding model loaded")
+    
+    return _embedder
 
-# ======================================================================
+
+# =============================================================================
 # RETRIEVAL
-# ======================================================================
+# =============================================================================
 
-def retrieve_sections(query: str):
-    embedder_local = get_embedder()
+def retrieve_sections(query: str) -> list[dict]:
+    """
+    Retrieve relevant legal sections for a query.
 
-    query_vec = embedder_local.encode(
+    Args:
+        query: The user's question.
+
+    Returns:
+        List of matching sections with scores.
+    """
+    if _index is None or _metadata is None:
+        logger.error("RAG not initialized")
+        return []
+
+    embedder = _get_embedder()
+
+    # Encode query
+    query_vec = embedder.encode(
         [query],
         convert_to_numpy=True,
-        normalize_embeddings=True
+        normalize_embeddings=True,
     ).astype("float32")
 
-    scores, indices = index.search(query_vec, TOP_K)
+    # Search
+    scores, indices = _index.search(query_vec, TOP_K)
 
     results = []
     for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
+        if idx == -1 or idx >= len(_metadata):
             continue
-
-        record = metadata[idx].copy()
+        record = _metadata[idx].copy()
         record["score"] = float(score)
         results.append(record)
 
+    logger.debug(f"Retrieved {len(results)} sections for query")
     return results
 
-# ======================================================================
-# PROMPTS
-# ======================================================================
 
-SYSTEM_PROMPT_A = """You are Nyay Sathi, a helpful Indian legal assistant.
+# =============================================================================
+# PROMPTS
+# =============================================================================
+
+SYSTEM_PROMPT_GROUNDED = """You are Nyay Sathi, a helpful Indian legal assistant.
 MODE: RAG-BACKED (HIGH CONFIDENCE).
 
 INSTRUCTIONS:
@@ -131,25 +166,40 @@ MANDATORY DISCLAIMER:
 End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
 """
 
-SYSTEM_PROMPT_B = """You are Nyay Sathi, a helpful Indian legal assistant.
+SYSTEM_PROMPT_FALLBACK = """You are Nyay Sathi, a helpful Indian legal assistant.
 MODE: GENERAL FALLBACK.
 
 INSTRUCTIONS:
-1. No specific legal section matched.
-2. Do NOT cite Acts or Sections.
+1. No specific legal section matched the query.
+2. Do NOT cite specific Acts or Sections.
 3. Give only high-level educational explanation.
-4. Encourage rephrasing the question.
+4. Suggest the user rephrase their question.
 5. Do NOT give legal advice.
 
 MANDATORY DISCLAIMER:
 End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
 """
 
-# ======================================================================
-# LLM EXPLANATION
-# ======================================================================
 
-def explain_with_llm(query, retrieved):
+# =============================================================================
+# LLM EXPLANATION
+# =============================================================================
+
+def explain_with_llm(
+    query: str,
+    retrieved: list[dict],
+) -> tuple[str, str, float]:
+    """
+    Generate an LLM explanation for retrieved sections.
+
+    Args:
+        query: The user's question.
+        retrieved: List of retrieved sections.
+
+    Returns:
+        Tuple of (mode, explanation, top_score).
+    """
+    # Determine mode based on confidence
     if not retrieved:
         mode = "fallback"
         top_score = 0.0
@@ -157,6 +207,9 @@ def explain_with_llm(query, retrieved):
         top_score = retrieved[0]["score"]
         mode = "grounded" if top_score >= CONFIDENCE_THRESHOLD else "fallback"
 
+    logger.debug(f"LLM mode: {mode}, top_score: {top_score:.3f}")
+
+    # Build prompt
     if mode == "grounded":
         context = ""
         for r in retrieved:
@@ -166,15 +219,24 @@ def explain_with_llm(query, retrieved):
                 f"Section: {r.get('section_number', 'Unknown')}\n"
                 f"Text: {r.get('text', '')}\n"
             )
-
         user_content = f"USER QUESTION:\n{query}\n\nLEGAL TEXT:\n{context}"
-        system_prompt = SYSTEM_PROMPT_A
+        system_prompt = SYSTEM_PROMPT_GROUNDED
     else:
         user_content = f"USER QUESTION:\n{query}\n\n(No relevant legal text found)"
-        system_prompt = SYSTEM_PROMPT_B
+        system_prompt = SYSTEM_PROMPT_FALLBACK
+
+    # Call LLM
+    if _client is None:
+        logger.warning("Groq client not available")
+        return (
+            "fallback",
+            "LLM service not available. Please check API key configuration.\n\n"
+            "Disclaimer: This information is for educational purposes only.",
+            0.0,
+        )
 
     try:
-        response = client.chat.completions.create(
+        response = _client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -183,14 +245,16 @@ def explain_with_llm(query, retrieved):
             temperature=0.1,
             max_tokens=500,
         )
-
-        return mode, response.choices[0].message.content.strip(), top_score
+        explanation = response.choices[0].message.content.strip()
+        logger.debug("LLM response generated successfully")
+        return mode, explanation, top_score
 
     except Exception as e:
-        print("LLM error:", e)
+        logger.error(f"LLM error: {e}")
         return (
             "fallback",
-            "System error occurred. "
-            "Disclaimer: This information is for educational purposes only and does not constitute legal advice.",
+            "An error occurred while generating the explanation. "
+            "Please try again later.\n\n"
+            "Disclaimer: This information is for educational purposes only.",
             0.0,
         )

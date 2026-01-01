@@ -1,10 +1,75 @@
-data/
-*.pkl
-*.faiss
-*.index
-__pycache__/
+# =============================================================================
+# Files to EXCLUDE from Docker build
+# =============================================================================
+
+# Git
 .git/
 .gitignore
-scripts/
-venv/
+.gitattributes
+
+# Environment files (secrets - never include)
 .env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =============================================================================
+# Data - ONLY exclude raw data, keep processed for runtime
+# =============================================================================
+
+# Raw data (not needed for runtime)
+data/raw/
+
+# Keep these (they ARE needed):
+# data/processed/faiss.index
+# data/processed/faiss_meta.pkl
+
+# =============================================================================
+# Development files (not needed in production)
+# =============================================================================
+
+# Scripts (data pipeline - only for development)
+scripts/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Test files
+test_*.py
+*_test.py
+tests/
+pytest.ini
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

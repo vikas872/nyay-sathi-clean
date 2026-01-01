@@ -1,88 +1,143 @@
+"""
+Build FAISS index from chunked section data.
+
+This script generates embeddings for all chunks and builds a FAISS
+index for fast similarity search.
+"""
+
 import json
 import pickle
-import os
 import sys
-import numpy as np
+from pathlib import Path
+
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# Constants
-DATA_FILE = "data/processed/sections_chunks.json"
-INDEX_FILE = "data/processed/faiss.index"
-META_FILE = "data/processed/faiss_meta.pkl"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+from config import (
+    CHUNKS_FILE,
+    FAISS_INDEX_FILE,
+    FAISS_META_FILE,
+    EMBEDDING_MODEL,
+    ensure_directories,
+)
+from utils import setup_logger
 
-def main():
-    print(f"Starting FAISS index build...")
-    
-    # 1. Load Data
-    if not os.path.exists(DATA_FILE):
-        print(f"Error: Data file not found at {DATA_FILE}")
+logger = setup_logger(__name__)
+
+
+def load_chunks() -> list[dict]:
+    """
+    Load chunked section data.
+
+    Returns:
+        List of chunk dictionaries.
+    """
+    if not CHUNKS_FILE.exists():
+        logger.error(f"Chunks file not found: {CHUNKS_FILE}")
         sys.exit(1)
-        
-    print(f"Loading chunks from {DATA_FILE}...")
-    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+    
+    with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         chunks = json.load(f)
     
-    if not chunks:
-        print("Error: No chunks found in data file.")
-        sys.exit(1)
-        
-    print(f"Loaded {len(chunks)} chunks.")
+    logger.info(f"Loaded {len(chunks)} chunks")
+    return chunks
+
+
+def generate_embeddings(
+    texts: list[str],
+    model_name: str = EMBEDDING_MODEL,
+) -> np.ndarray:
+    """
+    Generate embeddings for texts.
+
+    Args:
+        texts: List of text strings.
+        model_name: Name of the embedding model.
+
+    Returns:
+        Numpy array of embeddings.
+    """
+    logger.info(f"Loading model: {model_name}")
+    model = SentenceTransformer(model_name)
     
-    # Extract texts for embedding
-    texts = [chunk.get('text', '') for chunk in chunks]
+    logger.info("Generating embeddings...")
+    embeddings = model.encode(
+        texts,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,  # For cosine similarity with IP index
+    )
     
-    # 2. Generate Embeddings
-    print(f"Loading embedding model: {MODEL_NAME}...")
-    try:
-        model = SentenceTransformer(MODEL_NAME)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        sys.exit(1)
-        
-    print("Generating embeddings (this may take a while)...")
-    # Normalize embeddings to use Cosine Similarity with Inner Product (IP) index
-    embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True)
-    
-    print(f"Embeddings shape: {embeddings.shape}")
-    
-    # 3. Build FAISS Index
-    print("Building FAISS index...")
+    logger.info(f"Embeddings shape: {embeddings.shape}")
+    return embeddings
+
+
+def build_index(embeddings: np.ndarray) -> faiss.Index:
+    """
+    Build FAISS index from embeddings.
+
+    Args:
+        embeddings: Numpy array of embeddings.
+
+    Returns:
+        FAISS index.
+    """
     dimension = embeddings.shape[1]
     
-    # IndexFlatIP uses Inner Product (Dot Product). 
-    # Since embeddings are normalized, this equals Cosine Similarity.
+    # IndexFlatIP with normalized embeddings = Cosine Similarity
     index = faiss.IndexFlatIP(dimension)
-    
     index.add(embeddings)
     
-    print(f"Index built. Total vectors: {index.ntotal}")
+    logger.info(f"Index built with {index.ntotal} vectors")
+    return index
+
+
+def save_outputs(index: faiss.Index, chunks: list[dict]) -> None:
+    """
+    Save FAISS index and metadata.
+
+    Args:
+        index: FAISS index to save.
+        chunks: Chunk metadata to save.
+    """
+    FAISS_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
     
-    # 4. Save Outputs
-    print(f"Saving index to {INDEX_FILE}...")
-    try:
-        os.makedirs(os.path.dirname(INDEX_FILE), exist_ok=True)
-        faiss.write_index(index, INDEX_FILE)
-    except Exception as e:
-        print(f"Error saving index: {e}")
-        sys.exit(1)
-        
-    print(f"Saving metadata to {META_FILE}...")
-    try:
-        with open(META_FILE, 'wb') as f:
-            pickle.dump(chunks, f)
-    except Exception as e:
-        print(f"Error saving metadata: {e}")
-        sys.exit(1)
-        
-    # Final Verification
-    if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE):
-        print("\nSUCCESS: FAISS index and metadata build complete.")
-        print(f"Files saved:\n- {INDEX_FILE}\n- {META_FILE}")
-        print(f"Total number of vectors stored: {index.ntotal}")
-    else:
-        print("\nWARNING: Verification failed. Output files missing.")
+    logger.info(f"Saving index to {FAISS_INDEX_FILE}")
+    faiss.write_index(index, str(FAISS_INDEX_FILE))
+    
+    logger.info(f"Saving metadata to {FAISS_META_FILE}")
+    with open(FAISS_META_FILE, "wb") as f:
+        pickle.dump(chunks, f)
+
+
+def main() -> None:
+    """Main entry point for building FAISS index."""
+    logger.info("Starting FAISS index build...")
+    ensure_directories()
+    
+    # Load data
+    chunks = load_chunks()
+    if not chunks:
+        logger.error("No chunks to process")
+        return
+    
+    texts = [chunk.get("text", "") for chunk in chunks]
+    
+    # Generate embeddings
+    embeddings = generate_embeddings(texts)
+    
+    # Build index
+    index = build_index(embeddings)
+    
+    # Save outputs
+    save_outputs(index, chunks)
+    
+    logger.info("FAISS index build complete!")
+    logger.info(f"  Index: {FAISS_INDEX_FILE}")
+    logger.info(f"  Metadata: {FAISS_META_FILE}")
+    logger.info(f"  Total vectors: {index.ntotal}")
+
 
 if __name__ == "__main__":
     main()
