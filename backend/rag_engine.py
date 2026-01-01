@@ -1,52 +1,55 @@
-# ================= RAILWAY / FREE TIER SAFETY =================
+# ================= RAILWAY / FREE-TIER SAFE RAG ENGINE =================
 import os
 
-# Force CPU-only execution (critical for free tiers)
+# ---- HARD SAFETY FLAGS (must be first) ----
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TORCH_DEVICE"] = "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ================= IMPORTS =================
 import pickle
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from groq import Groq
-from dotenv import load_dotenv
 from pathlib import Path
+from dotenv import load_dotenv
+from groq import Groq
 
-# ================= ENV =================
+# ---------------- ENV ----------------
 load_dotenv()
 
-# ================= CONFIG =================
-
-# Resolve project root reliably
+# ---------------- PATH RESOLUTION ----------------
+# File is: backend/rag_engine.py
+# Repo root is one level up from backend/
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data" / "processed"
 
 FAISS_INDEX_PATH = DATA_DIR / "faiss.index"
 FAISS_META_PATH = DATA_DIR / "faiss_meta.pkl"
 
+# ---------------- CONFIG ----------------
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 GROQ_MODEL = "llama-3.1-8b-instant"
-
-# Keep small to reduce memory & latency
-TOP_K = 3
+TOP_K = 5
 CONFIDENCE_THRESHOLD = 0.50
 
-# ================= GLOBALS =================
+# ---------------- GLOBALS (LAZY) ----------------
 index = None
 metadata = None
 embedder = None
 client = None
 
-# ================= INIT =================
+# ======================================================================
+# INITIALIZATION (LIGHTWEIGHT ONLY)
+# ======================================================================
 
 def initialize_rag():
-    """Initialize FAISS, metadata, embedder, and Groq client."""
-    global index, metadata, embedder, client
+    """
+    Initialize ONLY what is required for startup.
+    DO NOT load embedding model here (memory heavy).
+    """
+    global index, metadata, client
 
-    print("Starting Nyay Sathi Backend...")
-    print("Resolving data paths...")
+    print("Starting Nyay Sathi Backend (Railway Safe Mode)")
+    print(f"FAISS path: {FAISS_INDEX_PATH}")
 
     if not FAISS_INDEX_PATH.exists():
         raise FileNotFoundError(f"FAISS index not found at {FAISS_INDEX_PATH}")
@@ -54,64 +57,48 @@ def initialize_rag():
     if not FAISS_META_PATH.exists():
         raise FileNotFoundError(f"FAISS metadata not found at {FAISS_META_PATH}")
 
-    print("Loading FAISS index...")
+    # Load FAISS index (read-only, CPU)
     index = faiss.read_index(str(FAISS_INDEX_PATH))
-    print(f"FAISS vectors loaded: {index.ntotal}")
+    print(f"FAISS loaded with {index.ntotal} vectors")
 
-    print("Loading metadata...")
+    # Load metadata
     with open(FAISS_META_PATH, "rb") as f:
         metadata = pickle.load(f)
 
-    print("Loading embedding model (CPU-only)...")
-    embedder = SentenceTransformer(
-        EMBED_MODEL,
-        device="cpu"
-    )
-
-    print("Initializing Groq client...")
+    # Init Groq client
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    print("RAG System Initialized successfully.")
+    print("RAG system initialized successfully (light mode)")
 
-# ================= PROMPTS =================
+# ======================================================================
+# LAZY EMBEDDING MODEL LOADER
+# ======================================================================
 
-SYSTEM_PROMPT_A = """You are Nyay Sathi, a helpful Indian legal assistant.
-MODE: RAG-BACKED (HIGH CONFIDENCE).
+def get_embedder():
+    """
+    Load SentenceTransformer ONLY when first query comes.
+    Prevents Railway free-tier OOM during startup.
+    """
+    global embedder
+    if embedder is None:
+        print("Loading embedding model lazily...")
+        from sentence_transformers import SentenceTransformer
+        embedder = SentenceTransformer(EMBED_MODEL, device="cpu")
+    return embedder
 
-INSTRUCTIONS:
-1. You are provided with retrieved legal sections from Indian laws.
-2. Answer the USER QUESTION using ONLY the provided LEGAL TEXT.
-3. Explicitly mention the Act Name and Section Number if available.
-4. Explain the provision in simple English for a layperson.
-5. If the text does not answer the question, clearly state so.
-6. DO NOT invent laws, punishments, or procedures.
-7. DO NOT give legal advice.
-
-MANDATORY DISCLAIMER:
-End your response with:
-"Disclaimer: This information is for educational purposes only and does not constitute legal advice."
-"""
-
-SYSTEM_PROMPT_B = """You are Nyay Sathi, a helpful Indian legal assistant.
-MODE: GENERAL FALLBACK (LOW CONFIDENCE).
-
-INSTRUCTIONS:
-1. No specific legal sections matched the query.
-2. Do NOT cite Acts or Sections.
-3. Do NOT invent punishments or procedures.
-4. Provide a high-level educational explanation.
-5. Encourage the user to rephrase if needed.
-6. DO NOT give legal advice.
-
-MANDATORY DISCLAIMER:
-End your response with:
-"Disclaimer: This information is for educational purposes only and does not constitute legal advice."
-"""
-
-# ================= CORE LOGIC =================
+# ======================================================================
+# RETRIEVAL
+# ======================================================================
 
 def retrieve_sections(query: str):
-    query_vec = embedder.encode([query], normalize_embeddings=True).astype("float32")
+    embedder_local = get_embedder()
+
+    query_vec = embedder_local.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
+
     scores, indices = index.search(query_vec, TOP_K)
 
     results = []
@@ -125,8 +112,44 @@ def retrieve_sections(query: str):
 
     return results
 
+# ======================================================================
+# PROMPTS
+# ======================================================================
 
-def explain_with_llm(query: str, retrieved: list):
+SYSTEM_PROMPT_A = """You are Nyay Sathi, a helpful Indian legal assistant.
+MODE: RAG-BACKED (HIGH CONFIDENCE).
+
+INSTRUCTIONS:
+1. Use ONLY the provided legal text.
+2. Mention Act Name and Section Number if present.
+3. Explain in simple, clear English.
+4. If text does not answer the question, say so clearly.
+5. Do NOT invent laws or punishments.
+6. Do NOT give legal advice.
+
+MANDATORY DISCLAIMER:
+End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
+"""
+
+SYSTEM_PROMPT_B = """You are Nyay Sathi, a helpful Indian legal assistant.
+MODE: GENERAL FALLBACK.
+
+INSTRUCTIONS:
+1. No specific legal section matched.
+2. Do NOT cite Acts or Sections.
+3. Give only high-level educational explanation.
+4. Encourage rephrasing the question.
+5. Do NOT give legal advice.
+
+MANDATORY DISCLAIMER:
+End with: "Disclaimer: This information is for educational purposes only and does not constitute legal advice."
+"""
+
+# ======================================================================
+# LLM EXPLANATION
+# ======================================================================
+
+def explain_with_llm(query, retrieved):
     if not retrieved:
         mode = "fallback"
         top_score = 0.0
@@ -138,22 +161,17 @@ def explain_with_llm(query: str, retrieved: list):
         context = ""
         for r in retrieved:
             context += (
-                f"--- ITEM ---\n"
+                f"---\n"
                 f"Act: {r.get('act_name', 'Unknown')}\n"
                 f"Section: {r.get('section_number', 'Unknown')}\n"
                 f"Text: {r.get('text', '')}\n"
-                f"Confidence: {r.get('score'):.2f}\n"
             )
 
+        user_content = f"USER QUESTION:\n{query}\n\nLEGAL TEXT:\n{context}"
         system_prompt = SYSTEM_PROMPT_A
-        user_content = f"USER QUESTION: {query}\n\nLEGAL TEXT FOUND:\n{context}"
-
     else:
+        user_content = f"USER QUESTION:\n{query}\n\n(No relevant legal text found)"
         system_prompt = SYSTEM_PROMPT_B
-        user_content = (
-            f"USER QUESTION: {query}\n\n"
-            f"(No high-confidence legal sections matched)"
-        )
 
     try:
         response = client.chat.completions.create(
@@ -169,10 +187,10 @@ def explain_with_llm(query: str, retrieved: list):
         return mode, response.choices[0].message.content.strip(), top_score
 
     except Exception as e:
-        print(f"LLM Error: {e}")
+        print("LLM error:", e)
         return (
             "fallback",
-            "System is temporarily unavailable. "
+            "System error occurred. "
             "Disclaimer: This information is for educational purposes only and does not constitute legal advice.",
             0.0,
         )
