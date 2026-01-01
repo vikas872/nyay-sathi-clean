@@ -17,8 +17,20 @@ load_dotenv()
 # PATH CONFIGURATION
 # =============================================================================
 
-# Backend is at: backend/config.py → parent.parent = project root
-BASE_DIR: Final[Path] = Path(__file__).resolve().parent.parent
+# In Docker: files are at /app/*.py, data at /app/data/processed/
+# Locally: backend/config.py → parent.parent = project root
+# We need to handle both cases
+
+_config_file = Path(__file__).resolve()
+
+# Check if we're in Docker (files at /app/*.py) or local (backend/*.py)
+if _config_file.parent.name == "app":
+    # Docker: /app/config.py → /app
+    BASE_DIR: Final[Path] = _config_file.parent
+else:
+    # Local: backend/config.py → parent.parent = project root
+    BASE_DIR: Final[Path] = _config_file.parent.parent
+
 DATA_DIR: Final[Path] = BASE_DIR / "data" / "processed"
 
 FAISS_INDEX_PATH: Final[Path] = DATA_DIR / "faiss.index"
