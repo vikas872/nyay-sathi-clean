@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from auth import verify_api_key
 from config import CORS_ORIGINS, RATE_LIMIT_PER_MINUTE
 from logger import app_logger as logger
-from rag_engine import initialize_rag, process_query
+from rag_engine import initialize_rag
 from rate_limiter import RateLimitMiddleware
 from sanitizer import validate_query
 

@@ -173,43 +173,7 @@ def retrieve_sections(query: str, top_k: int = TOP_K) -> list[dict]:
 retrieve = retrieve_sections
 
 
-async def retrieve_with_web_fallback(
-    query: str,
-    top_k: int = TOP_K,
-) -> tuple[list[dict], list[Any], str]:
-    """
-    Retrieve sections with optional web search fallback.
 
-    If local RAG results have low confidence, also searches trusted web sources.
-
-    Args:
-        query: The user's question.
-        top_k: Number of local results to retrieve.
-
-    Returns:
-        Tuple of (local_results, web_results, source_mode).
-    """
-    # Get local results first
-    local_results = retrieve_sections(query, top_k)
-
-    # Determine if we need web fallback
-    top_score = local_results[0]["score"] if local_results else 0.0
-    needs_web_fallback = top_score < CONFIDENCE_THRESHOLD and WEB_SEARCH_ENABLED
-
-    web_results = []
-    source_mode = "local"
-
-    if needs_web_fallback:
-        logger.info("Low confidence - triggering web search fallback")
-        try:
-            from web_search import search_trusted_sources
-            web_results = await search_trusted_sources(query)
-            if web_results:
-                source_mode = "hybrid"
-        except Exception as e:
-            logger.error(f"Web search fallback failed: {e}")
-
-    return local_results, web_results, source_mode
 
 
 # =============================================================================
@@ -375,40 +339,4 @@ def explain_with_llm(
         )
 
 
-async def process_query(query: str) -> dict:
-    """
-    Process a user query end-to-end.
 
-    This is the main entry point for the RAG pipeline.
-
-    Args:
-        query: The user's legal question.
-
-    Returns:
-        Dictionary with answer, sources, confidence, and mode.
-    """
-    # Retrieve with optional web fallback
-    local_results, web_results, source_mode = await retrieve_with_web_fallback(query)
-
-    # Generate explanation
-    mode, explanation, score, tokens_in, tokens_out = explain_with_llm(
-        query, local_results, web_results, source_mode
-    )
-
-    # Format response
-    return {
-        "mode": mode,
-        "answer": explanation,
-        "confidence": score,
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "local_sources": local_results,
-        "web_sources": [
-            {
-                "url": wr.url,
-                "title": wr.title,
-                "domain": wr.source_domain,
-            }
-            for wr in (web_results or [])
-        ],
-    }

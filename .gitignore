@@ -43,6 +43,6 @@ logs/
 !.env.example
 
 # Large data files (optional - uncomment to exclude from git)
-# data/raw/
+data/raw/
 # data/processed/*.index
 # data/processed/*.pkl

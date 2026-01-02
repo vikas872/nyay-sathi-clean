@@ -354,22 +354,34 @@ def print_answer(
         console.print(colorize_citations(answer))
         console.print()
     
-    # Sources section
-    relevant = [s for s in local_sources if s.get("score", 0) > 0.5][:3]
+    # Sources section - only show sources that are actually cited in the answer
+    import re
+    cited_numbers = set(int(m) for m in re.findall(r'\[(\d+)\]', answer))
+    
+    # Filter to only sources that were cited
+    relevant = []
+    for i, src in enumerate(local_sources[:5], 1):  # Check up to 5
+        if i in cited_numbers:
+            relevant.append((i, src))
     
     if relevant and mode in ("grounded", "hybrid"):
         console.print()
         console.print("[dim]─── Sources ───[/dim]")
-        for i, src in enumerate(relevant, 1):
+        for idx, src in relevant:
             act = src.get("act", "Unknown")
             section = src.get("section", "")
             score = src.get("score", 0)
-            console.print(f"  [cyan][{i}][/cyan] {act}, Section {section} [dim]({score:.0%})[/dim]")
+            console.print(f"  [cyan][{idx}][/cyan] {act}, Section {section} [dim]({score:.0%})[/dim]")
     
     if web_sources and mode == "hybrid":
-        console.print("[dim]─── Web ───[/dim]")
-        for src in web_sources[:2]:
-            console.print(f"  [cyan]•[/cyan] {src.get('domain', '')} - {src.get('title', '')[:50]}")
+        console.print("[dim]─── Web Sources ───[/dim]")
+        for i, src in enumerate(web_sources[:3], 1):
+            title = src.get('title', '')[:50]
+            url = src.get('url', '')
+            domain = src.get('domain', '')
+            console.print(f"  [cyan][W{i}][/cyan] {title}")
+            if url:
+                console.print(f"       [link={url}]{url}[/link]", style="dim")
     
     # Footer
     console.print()
